@@ -502,6 +502,11 @@ struct netplay
    size_t replay_ptr;
    uint32_t replay_frame_count;
 
+   /* The target of our replay, i.e., the last frame that was unread as of the
+    * time we started replaying */
+   size_t replay_target_ptr;
+   uint32_t replay_target_frame_count;
+
    /* Size of savestates */
    size_t state_size;
 
@@ -540,13 +545,14 @@ struct netplay
    /* If true, never progress without peer input (stateless/rewindless mode) */
    bool stateless_mode;
 
-   /* We stall if we're far enough ahead that we couldn't transparently rewind.
-    * To know if we could transparently rewind, we need to know how long
-    * running a frame takes. We record that every frame and get a running
-    * (window) average */
+   /* We keep track of how long each frame takes so that we can (attempt to)
+    * make our rewind transparent. */
    retro_time_t frame_run_time[NETPLAY_FRAME_RUN_TIME_WINDOW];
    int frame_run_time_ptr;
    retro_time_t frame_run_time_sum, frame_run_time_avg;
+
+   /* And the beginning time of the current frame, so we know our deadline */
+   retro_time_t frame_start_time;
 
    /* Latency frames and limits */
    unsigned input_latency_frames;

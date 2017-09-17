@@ -15,6 +15,7 @@
  *  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -26,6 +27,7 @@
 #include "../../autosave.h"
 #include "../../driver.h"
 #include "../../input/input_driver.h"
+#include "../../gfx/video_driver.h"
 
 #if 0
 #define DEBUG_NONDETERMINISTIC_CORES
@@ -504,6 +506,7 @@ static void netplay_handle_frame_hash(netplay_t *netplay, struct delta_frame *de
 bool netplay_sync_pre_frame(netplay_t *netplay)
 {
    retro_ctx_serialize_info_t serial_info;
+   netplay->frame_start_time = cpu_features_get_time_usec();
 
    if (netplay_delta_frame_ready(netplay, &netplay->buffer[netplay->run_ptr], netplay->run_frame_count))
    {
@@ -684,6 +687,7 @@ process:
 void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
 {
    uint32_t lo_frame_count, hi_frame_count;
+   bool do_rewind = false, full_replay = false;
 
    /* Unless we're stalling, we've just finished running a frame */
    if (!stalled)
@@ -724,55 +728,111 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
       netplay->force_reset = false;
    }
 
-   netplay->replay_ptr = netplay->other_ptr;
-   netplay->replay_frame_count = netplay->other_frame_count;
-
-#ifndef DEBUG_NONDETERMINISTIC_CORES
-   if (!netplay->force_rewind)
+   /* Figure out whether to replay and where to replay from */
+   if (netplay->force_rewind)
    {
-      bool cont = true;
-
-      /* Skip ahead if we predicted correctly.
-       * Skip until our simulation failed. */
-      while (netplay->other_frame_count < netplay->unread_frame_count &&
-             netplay->other_frame_count < netplay->run_frame_count)
-      {
-         struct delta_frame *ptr = &netplay->buffer[netplay->other_ptr];
-
-         /* If resolving the input changes it, we used bad input */
-         if (netplay_resolve_input(netplay, netplay->other_ptr, true))
-         {
-            cont = false;
-            break;
-         }
-
-         netplay_handle_frame_hash(netplay, ptr);
-         netplay->other_ptr = NEXT_PTR(netplay->other_ptr);
-         netplay->other_frame_count++;
-      }
       netplay->replay_ptr = netplay->other_ptr;
       netplay->replay_frame_count = netplay->other_frame_count;
+      netplay->replay_target_ptr = netplay->unread_ptr;
+      netplay->replay_target_frame_count = netplay->unread_frame_count;
+      do_rewind = true;
+   }
+   else if (netplay->replay_frame_count != 0)
+   {
+      /* Already in a replay, continue it */
+      do_rewind = true;
+   }
+   else if (netplay->other_frame_count < netplay->unread_frame_count &&
+            netplay->other_frame_count < netplay->run_frame_count)
+   {
+      /* Normal replay situation: We have more data to play back */
+      netplay->replay_ptr = netplay->other_ptr;
+      netplay->replay_frame_count = netplay->other_frame_count;
+      netplay->replay_target_ptr = netplay->unread_ptr;
+      netplay->replay_target_frame_count = netplay->unread_frame_count;
+      do_rewind = true;
 
-      if (cont)
+#ifndef DEBUG_NONDETERMINISTIC_CORES
+      if (!netplay->force_rewind)
       {
-         while (netplay->replay_frame_count < netplay->run_frame_count)
+         bool cont = true;
+
+         /* Skip ahead if we predicted correctly.
+          * Skip until our simulation failed. */
+         while (netplay->other_frame_count < netplay->unread_frame_count &&
+                netplay->other_frame_count < netplay->run_frame_count)
          {
-            struct delta_frame *ptr = &netplay->buffer[netplay->replay_ptr];
-            if (netplay_resolve_input(netplay, netplay->replay_ptr, true))
+            struct delta_frame *ptr = &netplay->buffer[netplay->other_ptr];
+
+            /* If resolving the input changes it, we used bad input */
+            if (netplay_resolve_input(netplay, netplay->other_ptr, true))
+            {
+               cont = false;
                break;
-            netplay->replay_ptr = NEXT_PTR(netplay->replay_ptr);
-            netplay->replay_frame_count++;
+            }
+
+            netplay_handle_frame_hash(netplay, ptr);
+            netplay->other_ptr = NEXT_PTR(netplay->other_ptr);
+            netplay->other_frame_count++;
+         }
+         netplay->replay_ptr = netplay->other_ptr;
+         netplay->replay_frame_count = netplay->other_frame_count;
+
+         if (cont)
+         {
+            while (netplay->replay_frame_count < netplay->run_frame_count)
+            {
+               struct delta_frame *ptr = &netplay->buffer[netplay->replay_ptr];
+               if (netplay_resolve_input(netplay, netplay->replay_ptr, true))
+                  break;
+               netplay->replay_ptr = NEXT_PTR(netplay->replay_ptr);
+               netplay->replay_frame_count++;
+            }
+         }
+
+         if (netplay->replay_frame_count >= netplay->run_frame_count)
+         {
+            /* Finished with simulation, don't need to rewind */
+            netplay->replay_frame_count = 0;
+            do_rewind = false;
          }
       }
-   }
 #endif
+   }
 
    /* Now replay the real input if we've gotten ahead of it */
-   if (netplay->force_rewind ||
-       (netplay->replay_frame_count < netplay->unread_frame_count &&
-        netplay->replay_frame_count < netplay->run_frame_count))
+   if (do_rewind)
    {
       retro_ctx_serialize_info_t serial_info;
+      retro_time_t deadline;
+      struct delta_frame *run_frame;
+      struct retro_system_av_info *av_info =
+            video_viewport_get_system_av_info();
+
+      /* Figure out our deadline */
+      deadline = netplay->frame_start_time
+            + (retro_time_t) roundf(1000000.0f / (av_info->timing.fps))
+            - 1000 /* Give ourselves a millisecond of leeway */
+            - netplay->frame_run_time_avg /* Plus the runtime of one frame */;
+
+      if (netplay->quirks & NETPLAY_QUIRK_INITIALIZATION)
+         /* Make sure we're initialized before we start loading things */
+         netplay_wait_and_init_serialization(netplay);
+
+      /* Save the current state to reload if the replay doesn't finish */
+      run_frame = &netplay->buffer[netplay->run_ptr];
+      if (netplay_delta_frame_ready(netplay, run_frame, netplay->run_frame_count))
+      {
+         serial_info.data       = run_frame->state;
+         serial_info.data_const = NULL;
+         serial_info.size       = netplay->state_size;
+         if (!core_serialize(&serial_info))
+            full_replay = true;
+      }
+      else
+      {
+         full_replay = true;
+      }
 
       /* Replay frames. */
       netplay->is_replay = true;
@@ -791,35 +851,19 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
          netplay->replay_frame_count++;
       }
 
-      if (netplay->quirks & NETPLAY_QUIRK_INITIALIZATION)
-         /* Make sure we're initialized before we start loading things */
-         netplay_wait_and_init_serialization(netplay);
-
       serial_info.data       = NULL;
       serial_info.data_const = netplay->buffer[netplay->replay_ptr].state;
       serial_info.size       = netplay->state_size;
 
       if (!core_unserialize(&serial_info))
-      {
          RARCH_ERR("Netplay savestate loading failed: Prepare for desync!\n");
-      }
 
       while (netplay->replay_frame_count < netplay->run_frame_count)
       {
-         retro_time_t start, tm;
-
-         struct delta_frame *ptr = &netplay->buffer[netplay->replay_ptr];
-         serial_info.data       = ptr->state;
-         serial_info.size       = netplay->state_size;
-         serial_info.data_const = NULL;
+         retro_time_t start, end, tm;
+         struct delta_frame *ptr;
 
          start = cpu_features_get_time_usec();
-
-         /* Remember the current state */
-         memset(serial_info.data, 0, serial_info.size);
-         core_serialize(&serial_info);
-         if (netplay->replay_frame_count < netplay->unread_frame_count)
-            netplay_handle_frame_hash(netplay, ptr);
 
          /* Re-simulate this frame's input */
          netplay_resolve_input(netplay, netplay->replay_ptr, true);
@@ -829,6 +873,16 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
          autosave_unlock();
          netplay->replay_ptr = NEXT_PTR(netplay->replay_ptr);
          netplay->replay_frame_count++;
+
+         /* Remember the new state */
+         ptr = &netplay->buffer[netplay->replay_ptr];
+         serial_info.data       = ptr->state;
+         serial_info.size       = netplay->state_size;
+         serial_info.data_const = NULL;
+         memset(serial_info.data, 0, serial_info.size);
+         core_serialize(&serial_info);
+         if (netplay->replay_frame_count < netplay->replay_target_frame_count)
+            netplay_handle_frame_hash(netplay, ptr);
 
 #ifdef DEBUG_NONDETERMINISTIC_CORES
          if (ptr->have_remote && netplay_delta_frame_ready(netplay, &netplay->buffer[netplay->replay_ptr], netplay->replay_frame_count))
@@ -847,28 +901,56 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
 #endif
 
          /* Get our time window */
-         tm = cpu_features_get_time_usec() - start;
+         end = cpu_features_get_time_usec();
+         tm = end - start;
          netplay->frame_run_time_sum -= netplay->frame_run_time[netplay->frame_run_time_ptr];
          netplay->frame_run_time[netplay->frame_run_time_ptr] = tm;
          netplay->frame_run_time_sum += tm;
          netplay->frame_run_time_ptr++;
          if (netplay->frame_run_time_ptr >= NETPLAY_FRAME_RUN_TIME_WINDOW)
             netplay->frame_run_time_ptr = 0;
+
+         /* Figure out if we've blown our deadline */
+         if (netplay->replay_frame_count < netplay->run_frame_count &&
+             !full_replay &&
+             end >= deadline)
+         {
+            RARCH_LOG(
+                  "Netplay deadline blown, will continue replay next frame. Frame run time: %uns\n",
+                  (unsigned) netplay->frame_run_time_avg);
+            break;
+         }
       }
 
       /* Average our time */
       netplay->frame_run_time_avg = netplay->frame_run_time_sum / NETPLAY_FRAME_RUN_TIME_WINDOW;
 
-      if (netplay->unread_frame_count < netplay->run_frame_count)
+      /* If we did complete our replay, bring up other_* */
+      if (netplay->replay_frame_count >= netplay->run_frame_count)
       {
-         netplay->other_ptr = netplay->unread_ptr;
-         netplay->other_frame_count = netplay->unread_frame_count;
+         if (netplay->replay_target_frame_count < netplay->run_frame_count)
+         {
+            netplay->other_ptr = netplay->replay_target_ptr;
+            netplay->other_frame_count = netplay->replay_target_frame_count;
+         }
+         else
+         {
+            netplay->other_ptr = netplay->run_ptr;
+            netplay->other_frame_count = netplay->run_frame_count;
+         }
+         netplay->replay_frame_count = 0;
+
       }
       else
       {
-         netplay->other_ptr = netplay->run_ptr;
-         netplay->other_frame_count = netplay->run_frame_count;
+         /* Otherwise, we need to get back to the state we were in when we started */
+         serial_info.data = NULL;
+         serial_info.data_const = run_frame->state;
+         serial_info.size = netplay->state_size;
+         if (!core_unserialize(&serial_info))
+            RARCH_ERR("Netplay failed to reload state, prepare for desync!\n");
       }
+
       netplay->is_replay = false;
       netplay->force_rewind = false;
    }

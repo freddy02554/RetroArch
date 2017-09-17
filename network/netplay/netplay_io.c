@@ -1744,6 +1744,7 @@ static bool netplay_get_cmd(netplay_t *netplay,
             netplay->savestate_request_outstanding = false;
             netplay->other_ptr                     = load_ptr;
             netplay->other_frame_count             = load_frame_count;
+            netplay->replay_frame_count            = 0;
 
 #ifdef DEBUG_NETPLAY_STEPS
             RARCH_LOG("Loading state at %u\n", load_frame_count);

@@ -962,7 +962,6 @@ static void netplay_force_future(netplay_t *netplay)
    netplay->run_ptr = netplay->self_ptr;
    netplay->run_frame_count = netplay->self_frame_count;
 
-
    /* We need to ignore any intervening data from the other side,
     * and never rewind past this */
    netplay_update_unread_ptr(netplay);
@@ -990,6 +989,7 @@ static void netplay_force_future(netplay_t *netplay)
       netplay->other_ptr = netplay->run_ptr;
       netplay->other_frame_count = netplay->run_frame_count;
    }
+   netplay->replay_frame_count = 0;
 }
 
 /**
