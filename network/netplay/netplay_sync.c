@@ -508,54 +508,6 @@ bool netplay_sync_pre_frame(netplay_t *netplay)
    retro_ctx_serialize_info_t serial_info;
    netplay->frame_start_time = cpu_features_get_time_usec();
 
-   if (netplay_delta_frame_ready(netplay, &netplay->buffer[netplay->run_ptr], netplay->run_frame_count))
-   {
-      serial_info.data_const = NULL;
-      serial_info.data = netplay->buffer[netplay->run_ptr].state;
-      serial_info.size = netplay->state_size;
-
-      memset(serial_info.data, 0, serial_info.size);
-      if ((netplay->quirks & NETPLAY_QUIRK_INITIALIZATION) || netplay->run_frame_count == 0)
-      {
-         /* Don't serialize until it's safe */
-      }
-      else if (!(netplay->quirks & NETPLAY_QUIRK_NO_SAVESTATES) && core_serialize(&serial_info))
-      {
-         if (netplay->force_send_savestate && !netplay->stall && !netplay->remote_paused)
-         {
-            /* Bring our running frame and input frames into parity so we don't
-             * send old info */
-            if (netplay->run_ptr != netplay->self_ptr)
-            {
-               memcpy(netplay->buffer[netplay->self_ptr].state,
-                  netplay->buffer[netplay->run_ptr].state,
-                  netplay->state_size);
-               netplay->run_ptr = netplay->self_ptr;
-               netplay->run_frame_count = netplay->self_frame_count;
-            }
-
-            /* Send this along to the other side */
-            serial_info.data_const = netplay->buffer[netplay->run_ptr].state;
-            netplay_load_savestate(netplay, &serial_info, false);
-            netplay->force_send_savestate = false;
-         }
-      }
-      else
-      {
-         /* If the core can't serialize properly, we must stall for the
-          * remote input on EVERY frame, because we can't recover */
-         netplay->quirks |= NETPLAY_QUIRK_NO_SAVESTATES;
-         netplay->stateless_mode = true;
-      }
-
-      /* If we can't transmit savestates, we must stall until the client is ready */
-      if (netplay->run_frame_count > 0 &&
-          (netplay->quirks & (NETPLAY_QUIRK_NO_SAVESTATES|NETPLAY_QUIRK_NO_TRANSMISSION)) &&
-          (netplay->connections_size == 0 || !netplay->connections[0].active ||
-           netplay->connections[0].mode < NETPLAY_CONNECTION_CONNECTED))
-         netplay->stall = NETPLAY_STALL_NO_CONNECTION;
-   }
-
    if (netplay->is_server)
    {
       fd_set fds;
@@ -686,6 +638,7 @@ process:
  */
 void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
 {
+   retro_ctx_serialize_info_t serial_info;
    uint32_t lo_frame_count, hi_frame_count;
    bool do_rewind = false, full_replay = false;
 
@@ -704,6 +657,66 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
       netplay->self_frame_count++;
    }
 
+   /* Reset if it was requested */
+   if (netplay->force_reset)
+   {
+      core_reset();
+      netplay->force_reset = false;
+   }
+
+   /* Save the state we've now reached */
+   if (netplay_delta_frame_ready(netplay, &netplay->buffer[netplay->run_ptr], netplay->run_frame_count))
+   {
+      serial_info.data_const = NULL;
+      serial_info.data = netplay->buffer[netplay->run_ptr].state;
+      serial_info.size = netplay->state_size;
+
+      memset(serial_info.data, 0, serial_info.size);
+      if ((netplay->quirks & NETPLAY_QUIRK_INITIALIZATION))
+      {
+         /* Don't serialize until it's safe */
+         full_replay = true;
+      }
+      else if (!(netplay->quirks & NETPLAY_QUIRK_NO_SAVESTATES) && core_serialize(&serial_info))
+      {
+         if (netplay->force_send_savestate && !netplay->stall && !netplay->remote_paused)
+         {
+            /* Bring our running frame and input frames into parity so we don't
+             * send old info */
+            if (netplay->run_ptr != netplay->self_ptr)
+            {
+               memcpy(netplay->buffer[netplay->self_ptr].state,
+                  netplay->buffer[netplay->run_ptr].state,
+                  netplay->state_size);
+               netplay->run_ptr = netplay->self_ptr;
+               netplay->run_frame_count = netplay->self_frame_count;
+            }
+
+            /* Send this along to the other side */
+            serial_info.data_const = netplay->buffer[netplay->run_ptr].state;
+            netplay_load_savestate(netplay, &serial_info, false);
+            netplay->force_send_savestate = false;
+         }
+      }
+      else
+      {
+         /* If the core can't serialize properly, we must stall for the
+          * remote input on EVERY frame, because we can't recover */
+         netplay->quirks |= NETPLAY_QUIRK_NO_SAVESTATES;
+         netplay->stateless_mode = true;
+         full_replay = true;
+      }
+
+      /* If we can't transmit savestates, we must stall until the client is ready */
+      if (netplay->run_frame_count > 0 &&
+          (netplay->quirks & (NETPLAY_QUIRK_NO_SAVESTATES|NETPLAY_QUIRK_NO_TRANSMISSION)) &&
+          (netplay->connections_size == 0 || !netplay->connections[0].active ||
+           netplay->connections[0].mode < NETPLAY_CONNECTION_CONNECTED))
+         netplay->stall = NETPLAY_STALL_NO_CONNECTION;
+   }
+   else
+      full_replay = true;
+
    /* Only relevant if we're connected and not in a desynching operation */
    if ((netplay->is_server && (netplay->connected_players<=1)) ||
        (netplay->self_mode < NETPLAY_CONNECTION_CONNECTED) ||
@@ -719,13 +732,6 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
          driver_set_nonblock_state();
       }
       return;
-   }
-
-   /* Reset if it was requested */
-   if (netplay->force_reset)
-   {
-      core_reset();
-      netplay->force_reset = false;
    }
 
    /* Figure out whether to replay and where to replay from */
@@ -803,9 +809,7 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
    /* Now replay the real input if we've gotten ahead of it */
    if (do_rewind)
    {
-      retro_ctx_serialize_info_t serial_info;
       retro_time_t deadline;
-      struct delta_frame *run_frame;
       struct retro_system_av_info *av_info =
             video_viewport_get_system_av_info();
 
@@ -818,21 +822,6 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
       if (netplay->quirks & NETPLAY_QUIRK_INITIALIZATION)
          /* Make sure we're initialized before we start loading things */
          netplay_wait_and_init_serialization(netplay);
-
-      /* Save the current state to reload if the replay doesn't finish */
-      run_frame = &netplay->buffer[netplay->run_ptr];
-      if (netplay_delta_frame_ready(netplay, run_frame, netplay->run_frame_count))
-      {
-         serial_info.data       = run_frame->state;
-         serial_info.data_const = NULL;
-         serial_info.size       = netplay->state_size;
-         if (!core_serialize(&serial_info))
-            full_replay = true;
-      }
-      else
-      {
-         full_replay = true;
-      }
 
       /* Replay frames. */
       netplay->is_replay = true;
@@ -945,7 +934,7 @@ void netplay_sync_post_frame(netplay_t *netplay, bool stalled)
       {
          /* Otherwise, we need to get back to the state we were in when we started */
          serial_info.data = NULL;
-         serial_info.data_const = run_frame->state;
+         serial_info.data_const = netplay->buffer[netplay->run_ptr].state;
          serial_info.size = netplay->state_size;
          if (!core_unserialize(&serial_info))
             RARCH_ERR("Netplay failed to reload state, prepare for desync!\n");
